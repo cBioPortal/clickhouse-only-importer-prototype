@@ -2,22 +2,82 @@ package cna
 
 import (
 	"fmt"
+	"log"
+	"path/filepath"
+	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
-// public interface
-func ProcessTSVToParquet(
-	tsvPath, outputPath string,
-	schema *arrow.Schema,
-	mem memory.Allocator,
-	studyID, profileID string,
-) error {
-	recordChan, errChan := transformTSVStream(tsvPath, schema, mem, studyID, profileID)
+// CNAFileInput represents a single CNA file with its schema
+type CNAFileInput struct {
+	Path             string
+	Schema           *arrow.Schema
+	CancerStudyId    string
+	GeneticProfileId string
+}
 
-	// write in parallel with transform
+// ProcessMultipleTSVToParquet processes multiple CNA TSV files and writes each to its own parquet
+// file
+func ProcessMultipleTSVToParquet(
+	cnaFiles []CNAFileInput,
+	outputDir string,
+	mem memory.Allocator,
+) error {
+	for _, cnaFile := range cnaFiles {
+		log.Printf("processing: %s", cnaFile.Path)
+
+		// generate output filename based on input file path
+		outputPath := generateOutputPath(cnaFile.Path, outputDir)
+
+		if err := ProcessSingleTSVToParquet(cnaFile, outputPath, mem); err != nil {
+			return fmt.Errorf("error processing %s: %w", cnaFile.Path, err)
+		}
+
+		log.Printf("written: %s", outputPath)
+	}
+
+	return nil
+}
+
+// ProcessSingleTSVToParquet processes a single CNA TSV file and writes to a single parquet file
+func ProcessSingleTSVToParquet(
+	cnaFile CNAFileInput,
+	outputPath string,
+	mem memory.Allocator,
+) error {
+	recordChan := make(chan arrow.RecordBatch, 10)
+	errChan := make(chan error, 1)
+
+	// start goroutine to process the file
+	go func() {
+		defer close(recordChan)
+		defer close(errChan)
+
+		// get records from this file
+		fileChan, fileErrChan := transformTSVStream(
+			cnaFile.Path,
+			cnaFile.Schema,
+			mem,
+			cnaFile.CancerStudyId,
+			cnaFile.GeneticProfileId,
+		)
+
+		// forward all records from this file to the channel
+		for rec := range fileChan {
+			recordChan <- rec
+		}
+
+		// check for errors from this file
+		if err := <-fileErrChan; err != nil {
+			errChan <- fmt.Errorf("error processing %s: %w", cnaFile.Path, err)
+			return
+		}
+	}()
+
+	// write all records to parquet file
 	writeErr := WriteParquetStream(outputPath, recordChan, mem)
 
 	// check for transform errors
@@ -31,6 +91,20 @@ func ProcessTSVToParquet(
 	}
 
 	return nil
+}
+
+// generateOutputPath creates an output path for a parquet file based on the input TSV path
+func generateOutputPath(inputPath, outputDir string) string {
+	// get the study dir name
+	dir := filepath.Base(filepath.Dir(inputPath))
+	// get the base filename without extension
+	base := filepath.Base(inputPath)
+	// remove .txt extension and replace with .parquet
+	nameWithoutExt := strings.TrimSuffix(base, filepath.Ext(base))
+	// combine directory name (study) and filename
+	outputFilename := dir + "_" + nameWithoutExt + ".parquet"
+
+	return filepath.Join(outputDir, outputFilename)
 }
 
 // transformTSVStream reads records from TSV and transforms them into arrow record batch
