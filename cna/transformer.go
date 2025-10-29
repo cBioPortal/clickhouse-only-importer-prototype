@@ -188,7 +188,8 @@ func transformCNARecordBatch(
 	numCols := int(rec.NumCols())
 	numRows := int(rec.NumRows())
 
-	for colIdx := 1; colIdx < numCols; colIdx++ {
+	// we start at index 2 because 0:hugo, 1:entrez
+	for colIdx := 2; colIdx < numCols; colIdx++ {
 		colName := rec.ColumnName(colIdx)
 		alterations, ok := rec.Column(colIdx).(*array.String)
 		if !ok {
