@@ -21,33 +21,41 @@ import (
 // Converts TSV files to two parquet files each: *_genetic_alterations.parquet and *_genetic_profile_samples.parquet
 //go run ./cmd/cli/main.go -mode convert -tsv-dir ./data -parquet-dir ./output
 
+// convert-with-derived mode:
+// Converts TSV files to three parquet files each: *_genetic_alterations.parquet, *_genetic_profile_samples.parquet, and *_derived.parquet
+//go run ./cmd/cli/main.go -mode convert-with-derived -tsv-dir ./data -parquet-dir ./output
+
 // combine mode
 // Combines parquet files into two final files: combined-all-cna_genetic_alterations.parquet and combined-all-cna_genetic_profile_samples.parquet
-//go run ./cmd/cli/main.go -mode combine -parquet-dir ./output -output combine-all-cna.parquet
+//go run ./cmd/cli/main.go -mode combine -parquet-dir ./output -output combined-all-cna.parquet
+
+// combine-with-derived mode
+// Combines parquet files into three final files: *_genetic_alterations.parquet, *_genetic_profile_samples.parquet, and *_derived.parquet
+//go run ./cmd/cli/main.go -mode combine-with-derived -parquet-dir ./output -output combined-all-cna.parquet
 
 func main() {
 	// command-line flags
 	mode := flag.String(
 		"mode",
 		"convert",
-		"Operation mode: 'convert' (TSV to parquet) or 'combine' (merge parquet files)",
+		"Operation mode: 'convert' (TSV to parquet), 'convert-with-derived' (TSV to parquet with derived), 'combine' (merge parquet files), or 'combine-with-derived' (merge parquet files with derived)",
 	)
-	tsvRootDir := flag.String("tsv-dir", "", "Root directory containing TSV files (convert mode)")
+	tsvRootDir := flag.String("tsv-dir", "", "Root directory containing TSV files (convert and convert-with-derived modes)")
 	parquetDir := flag.String(
 		"parquet-dir",
 		"",
-		"Directory for parquet files (input for combine mode, output for convert mode)",
+		"Directory for parquet files (input for combine modes, output for convert modes)",
 	)
 	outputFile := flag.String(
 		"output",
 		"combined-all-cna.parquet",
-		"Output filename for combined parquet (combine mode)",
+		"Output filename for combined parquet (combine modes)",
 	)
 	flag.Parse()
 
 	// validate mode
-	if *mode != "convert" && *mode != "combine" {
-		log.Fatal("Invalid mode. Must be 'convert' or 'combine'")
+	if *mode != "convert" && *mode != "convert-with-derived" && *mode != "combine" && *mode != "combine-with-derived" {
+		log.Fatal("Invalid mode. Must be 'convert', 'convert-with-derived', 'combine', or 'combine-with-derived'")
 	}
 
 	// validate required flags
@@ -63,18 +71,31 @@ func main() {
 		if *tsvRootDir == "" {
 			log.Fatal("Error: -tsv-dir is required for convert mode")
 		}
-		runConvertMode(*tsvRootDir, *parquetDir, mem)
+		runConvertMode(*tsvRootDir, *parquetDir, false, mem)
+
+	case "convert-with-derived":
+		if *tsvRootDir == "" {
+			log.Fatal("Error: -tsv-dir is required for convert-with-derived mode")
+		}
+		runConvertMode(*tsvRootDir, *parquetDir, true, mem)
 
 	case "combine":
-		runCombineMode(*parquetDir, *outputFile, mem)
+		runCombineMode(*parquetDir, *outputFile, false, mem)
+
+	case "combine-with-derived":
+		runCombineMode(*parquetDir, *outputFile, true, mem)
 	}
 
 	elapsed := time.Since(startTime)
 	log.Printf("Total execution time: %s", elapsed)
 }
 
-func runConvertMode(tsvRootDir, parquetDir string, mem memory.Allocator) {
-	log.Print("=== CONVERT MODE: TSV to individual Parquet files ===")
+func runConvertMode(tsvRootDir, parquetDir string, includeDerived bool, mem memory.Allocator) {
+	if includeDerived {
+		log.Print("=== CONVERT WITH DERIVED MODE: TSV to individual Parquet files (with derived) ===")
+	} else {
+		log.Print("=== CONVERT MODE: TSV to individual Parquet files ===")
+	}
 	log.Printf("Scanning for data_CNA.txt files in: %s", tsvRootDir)
 
 	cnaFiles, err := findCNAFiles(tsvRootDir)
@@ -94,24 +115,43 @@ func runConvertMode(tsvRootDir, parquetDir string, mem memory.Allocator) {
 		log.Fatalf("Failed to create output directory: %v", err)
 	}
 
-	log.Print("Transforming TSV files and writing individual parquet files (streaming)")
-	if err := cna.ProcessMultipleTSVToParquet(cnaFiles, parquetDir, mem); err != nil {
-		log.Fatalf("Error processing TSV files: %v", err)
+	if includeDerived {
+		log.Print("Transforming TSV files and writing individual parquet files including derived (streaming)")
+		if err := cna.ProcessMultipleTSVToParquetWithDerived(cnaFiles, parquetDir, mem); err != nil {
+			log.Fatalf("Error processing TSV files: %v", err)
+		}
+		log.Printf("✓ Individual parquet files (including derived) written to: %s", parquetDir)
+	} else {
+		log.Print("Transforming TSV files and writing individual parquet files (streaming)")
+		if err := cna.ProcessMultipleTSVToParquet(cnaFiles, parquetDir, mem); err != nil {
+			log.Fatalf("Error processing TSV files: %v", err)
+		}
+		log.Printf("✓ Individual parquet files written to: %s", parquetDir)
 	}
 
-	log.Printf("✓ Individual parquet files written to: %s", parquetDir)
 	log.Printf("✓ Number of CNA files processed: %d", len(cnaFiles))
 }
 
-func runCombineMode(parquetDir, outputFile string, mem memory.Allocator) {
-	log.Print("=== COMBINE MODE: Merge Parquet files into two combined files ===")
+func runCombineMode(parquetDir, outputFile string, includeDerived bool, mem memory.Allocator) {
+	if includeDerived {
+		log.Print("=== COMBINE WITH DERIVED MODE: Merge Parquet files into three combined files ===")
+	} else {
+		log.Print("=== COMBINE MODE: Merge Parquet files into two combined files ===")
+	}
 	log.Printf("Reading parquet files from: %s", parquetDir)
 
-	// Generate two output paths based on the provided output file
-	alterationsOutputPath, samplesOutputPath := generateCombinedOutputPaths(parquetDir, outputFile)
+	var alterationsOutputPath, samplesOutputPath, derivedOutputPath string
 
-	log.Printf("Combining genetic alterations files into: %s", alterationsOutputPath)
-	log.Printf("Combining genetic profile samples files into: %s", samplesOutputPath)
+	if includeDerived {
+		alterationsOutputPath, samplesOutputPath, derivedOutputPath = generateCombinedOutputPathsWithDerived(parquetDir, outputFile)
+		log.Printf("Combining genetic alterations files into: %s", alterationsOutputPath)
+		log.Printf("Combining genetic profile samples files into: %s", samplesOutputPath)
+		log.Printf("Combining derived files into: %s", derivedOutputPath)
+	} else {
+		alterationsOutputPath, samplesOutputPath = generateCombinedOutputPaths(parquetDir, outputFile)
+		log.Printf("Combining genetic alterations files into: %s", alterationsOutputPath)
+		log.Printf("Combining genetic profile samples files into: %s", samplesOutputPath)
+	}
 
 	// Combine genetic alterations files
 	alterationsPattern := filepath.Join(parquetDir, "*_genetic_alterations.parquet")
@@ -126,6 +166,15 @@ func runCombineMode(parquetDir, outputFile string, mem memory.Allocator) {
 		log.Fatalf("Error combining genetic profile samples files: %v", err)
 	}
 	log.Printf("✓ Combined genetic profile samples file written to: %s", samplesOutputPath)
+
+	// Combine derived files if requested
+	if includeDerived {
+		derivedPattern := filepath.Join(parquetDir, "*_derived.parquet")
+		if err := cna.CombineParquetFilesByPattern(derivedPattern, derivedOutputPath, mem); err != nil {
+			log.Fatalf("Error combining derived files: %v", err)
+		}
+		log.Printf("✓ Combined derived file written to: %s", derivedOutputPath)
+	}
 }
 
 // generateCombinedOutputPaths creates two output paths for combined files based on a base output filename
@@ -146,6 +195,27 @@ func generateCombinedOutputPaths(parquetDir, baseOutputFile string) (alterations
 	samplesPath = basePathWithoutExt + "_genetic_profile_samples.parquet"
 
 	return alterationsPath, samplesPath
+}
+
+// generateCombinedOutputPathsWithDerived creates three output paths for combined files including derived
+func generateCombinedOutputPathsWithDerived(parquetDir, baseOutputFile string) (alterationsPath, samplesPath, derivedPath string) {
+	// Use absolute path if provided, otherwise join with parquet directory
+	var basePath string
+	if filepath.IsAbs(baseOutputFile) {
+		basePath = baseOutputFile
+	} else {
+		basePath = filepath.Join(parquetDir, baseOutputFile)
+	}
+
+	// Remove .parquet extension if present
+	basePathWithoutExt := strings.TrimSuffix(basePath, ".parquet")
+
+	// Create three output paths
+	alterationsPath = basePathWithoutExt + "_genetic_alterations.parquet"
+	samplesPath = basePathWithoutExt + "_genetic_profile_samples.parquet"
+	derivedPath = basePathWithoutExt + "_derived.parquet"
+
+	return alterationsPath, samplesPath, derivedPath
 }
 
 func findCNAFiles(rootDir string) ([]cna.CNAFileInput, error) {
