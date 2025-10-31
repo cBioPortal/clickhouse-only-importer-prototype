@@ -83,21 +83,19 @@ func readParquetAsRecords(
 	return recordChan, errChan
 }
 
-// CombineParquetFiles combines multiple parquet files into a single parquet file
-func CombineParquetFiles(
-	inputDir string,
+// CombineParquetFilesByPattern combines multiple parquet files matching a glob pattern into a single parquet file
+func CombineParquetFilesByPattern(
+	pattern string,
 	outputPath string,
 	mem memory.Allocator,
 ) error {
-	// find all parquet files in the directory
-	pattern := filepath.Join(inputDir, "*.parquet")
 	parquetFiles, err := filepath.Glob(pattern)
 	if err != nil {
 		return fmt.Errorf("failed to find parquet files: %w", err)
 	}
 
 	if len(parquetFiles) == 0 {
-		return fmt.Errorf("no parquet files found in %s", inputDir)
+		return fmt.Errorf("no parquet files found matching pattern %s", pattern)
 	}
 
 	// filter out the output file if it already exists in the same directory
@@ -112,6 +110,8 @@ func CombineParquetFiles(
 	if len(parquetFiles) == 0 {
 		return fmt.Errorf("no input parquet files to combine")
 	}
+
+	log.Printf("Found %d files to combine", len(parquetFiles))
 
 	// create a channel to aggregate all records
 	combinedChan := make(chan arrow.RecordBatch, 10)

@@ -5,6 +5,7 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -19,8 +20,8 @@ type CNAFileInput struct {
 	GeneticProfileId string
 }
 
-// ProcessMultipleTSVToParquet processes multiple CNA TSV files and writes each to its own parquet
-// file
+// ProcessMultipleTSVToParquet processes multiple CNA TSV files and writes each to two parquet files:
+// one for genetic alterations and one for genetic profile samples
 func ProcessMultipleTSVToParquet(
 	cnaFiles []CNAFileInput,
 	outputDir string,
@@ -29,35 +30,38 @@ func ProcessMultipleTSVToParquet(
 	for _, cnaFile := range cnaFiles {
 		log.Printf("processing: %s", cnaFile.Path)
 
-		// generate output filename based on input file path
-		outputPath := generateOutputPath(cnaFile.Path, outputDir)
+		// generate output filenames based on input file path
+		alterationsPath, samplesPath := generateOutputPaths(cnaFile.Path, outputDir)
 
-		if err := ProcessSingleTSVToParquet(cnaFile, outputPath, mem); err != nil {
+		if err := ProcessSingleTSVToTwoParquets(cnaFile, alterationsPath, samplesPath, mem); err != nil {
 			return fmt.Errorf("error processing %s: %w", cnaFile.Path, err)
 		}
 
-		log.Printf("written: %s", outputPath)
+		log.Printf("written: %s", alterationsPath)
+		log.Printf("written: %s", samplesPath)
 	}
 
 	return nil
 }
 
-// ProcessSingleTSVToParquet processes a single CNA TSV file and writes to a single parquet file
-func ProcessSingleTSVToParquet(
+func ProcessSingleTSVToTwoParquets(
 	cnaFile CNAFileInput,
-	outputPath string,
+	alterationsPath string,
+	samplesPath string,
 	mem memory.Allocator,
 ) error {
-	recordChan := make(chan arrow.RecordBatch, 10)
-	errChan := make(chan error, 1)
+	alterationsChan := make(chan arrow.RecordBatch, 10)
+	samplesChan := make(chan arrow.RecordBatch, 10)
 
-	// start goroutine to process the file
+	// channel for all errors
+	errChan := make(chan error, 4) // transform + 2 writers + forwarding
+
+	// start transform and forwarding
 	go func() {
-		defer close(recordChan)
-		defer close(errChan)
+		defer close(alterationsChan)
+		defer close(samplesChan)
 
-		// get records from this file
-		fileChan, fileErrChan := transformTSVStream(
+		alterationsFileChan, samplesFileChan, fileErrChan := transformTSVStreamToTwo(
 			cnaFile.Path,
 			cnaFile.Schema,
 			mem,
@@ -65,60 +69,101 @@ func ProcessSingleTSVToParquet(
 			cnaFile.GeneticProfileId,
 		)
 
-		// forward all records from this file to the channel
-		for rec := range fileChan {
-			recordChan <- rec
-		}
+		var wg sync.WaitGroup
+		wg.Add(2)
 
-		// check for errors from this file
+		// forward alterations
+		go func() {
+			defer wg.Done()
+			for rec := range alterationsFileChan {
+				alterationsChan <- rec
+			}
+		}()
+
+		// forward samples
+		go func() {
+			defer wg.Done()
+			for rec := range samplesFileChan {
+				samplesChan <- rec
+			}
+		}()
+
+		wg.Wait()
+
+		// check for transform errors
 		if err := <-fileErrChan; err != nil {
 			errChan <- fmt.Errorf("error processing %s: %w", cnaFile.Path, err)
-			return
 		}
 	}()
 
-	// write all records to parquet file
-	writeErr := WriteParquetStream(outputPath, recordChan, mem)
+	// write both parquet files concurrently
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	// check for transform errors
-	if transformErr := <-errChan; transformErr != nil {
-		return transformErr
+	go func() {
+		defer wg.Done()
+		if err := WriteParquetStream(alterationsPath, alterationsChan, mem); err != nil {
+			errChan <- err
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := WriteParquetStream(samplesPath, samplesChan, mem); err != nil {
+			errChan <- err
+		}
+	}()
+
+	// wait for all operations to complete
+	wg.Wait()
+	close(errChan)
+
+	// Collect all errors
+	var errs []error
+	for err := range errChan {
+		errs = append(errs, err)
 	}
 
-	// check for write errors
-	if writeErr != nil {
-		return writeErr
+	if len(errs) > 0 {
+		return fmt.Errorf("errors: %v", errs)
 	}
 
 	return nil
 }
 
-// generateOutputPath creates an output path for a parquet file based on the input TSV path
-func generateOutputPath(inputPath, outputDir string) string {
+// ProcessSingleTSVToTwoParquets processes a single CNA TSV file and writes to two parquet files:
+// one for genetic alterations and one for genetic profile samples
+// generateOutputPaths creates two output paths: one for genetic alterations and one for genetic profile samples
+func generateOutputPaths(inputPath, outputDir string) (alterationsPath, samplesPath string) {
 	// get the study dir name
 	dir := filepath.Base(filepath.Dir(inputPath))
 	// get the base filename without extension
 	base := filepath.Base(inputPath)
-	// remove .txt extension and replace with .parquet
+	// remove .txt extension
 	nameWithoutExt := strings.TrimSuffix(base, filepath.Ext(base))
-	// combine directory name (study) and filename
-	outputFilename := dir + "_" + nameWithoutExt + ".parquet"
 
-	return filepath.Join(outputDir, outputFilename)
+	// create two different output filenames
+	alterationsFilename := dir + "_" + nameWithoutExt + "_genetic_alterations.parquet"
+	samplesFilename := dir + "_" + nameWithoutExt + "_genetic_profile_samples.parquet"
+
+	return filepath.Join(outputDir, alterationsFilename), filepath.Join(outputDir, samplesFilename)
 }
 
-// transformTSVStream reads records from TSV and transforms them into arrow record batch
-func transformTSVStream(
+// transformTSVStreamToTwo reads records from TSV and transforms them into two arrow record batch streams:
+// one for genetic alterations and one for genetic profile samples
+func transformTSVStreamToTwo(
 	tsvPath string,
 	schema *arrow.Schema,
 	mem memory.Allocator,
 	studyID, profileID string,
-) (<-chan arrow.RecordBatch, <-chan error) {
-	recordChan := make(chan arrow.RecordBatch, 10) // buffer a few records
+) (<-chan arrow.RecordBatch, <-chan arrow.RecordBatch, <-chan error) {
+	alterationsRecordChan := make(chan arrow.RecordBatch, 10) // buffer a few records
+	samplesRecordChan := make(chan arrow.RecordBatch, 10)     // buffer a few records
 	errChan := make(chan error, 1)
 
 	go func() {
-		defer close(recordChan)
+		defer close(alterationsRecordChan)
+		defer close(samplesRecordChan)
 		defer close(errChan)
 
 		rdr, file, err := ReadTSVAsRecords(tsvPath, schema, 100, '\t')
@@ -129,13 +174,16 @@ func transformTSVStream(
 		defer file.Close()
 		defer rdr.Release()
 
+		// Track if we've sent the samples record (should only send once)
+		samplesSent := false
+
 		for rdr.Next() {
 			rec := rdr.RecordBatch()
 			if rec == nil {
 				continue
 			}
 
-			tr, err := transformCNARecordBatch(studyID, profileID, rec, mem)
+			gar, gps, err := transformCNARecordBatch(studyID, profileID, rec, mem)
 			rec.Release()
 
 			if err != nil {
@@ -143,8 +191,17 @@ func transformTSVStream(
 				return
 			}
 
-			// send to channel (blocks if buffer full - provides backpressure)
-			recordChan <- tr
+			// Always send genetic alterations record
+			alterationsRecordChan <- gar
+
+			// Only send genetic profile samples record on first batch
+			if !samplesSent {
+				samplesRecordChan <- gps
+				samplesSent = true
+			} else {
+				// Release subsequent samples records since we don't need them
+				gps.Release()
+			}
 		}
 
 		if err := rdr.Err(); err != nil {
@@ -152,75 +209,124 @@ func transformTSVStream(
 		}
 	}()
 
-	return recordChan, errChan
+	return alterationsRecordChan, samplesRecordChan, errChan
 }
 
-// cnaTableSchema is the private schema used for all cna tables.
-var cnaTableSchema = arrow.NewSchema([]arrow.Field{
-	{Name: "SAMPLE_ID", Type: arrow.BinaryTypes.String},
+// geneticAlterationsSchema defines the schema for the gene-centric record batch
+var geneticAlterationsSchema = arrow.NewSchema([]arrow.Field{
 	{Name: "CANCER_STUDY", Type: arrow.BinaryTypes.String},
-	{Name: "GENE_SYMBOL", Type: arrow.BinaryTypes.String},
 	{Name: "GENETIC_PROFILE", Type: arrow.BinaryTypes.String},
-	{Name: "ALTERATION", Type: arrow.BinaryTypes.String},
+	{Name: "GENE_SYMBOL", Type: arrow.BinaryTypes.String},
+	{Name: "VALUES", Type: arrow.BinaryTypes.String},
 }, nil)
 
-// transformCNARecordBatch converts one tsv record batch into cna-format arrow record
+// geneticProfileSamplesSchema defines the schema for the sample order record batch
+var geneticProfileSamplesSchema = arrow.NewSchema([]arrow.Field{
+	{Name: "CANCER_STUDY", Type: arrow.BinaryTypes.String},
+	{Name: "GENETIC_PROFILE", Type: arrow.BinaryTypes.String},
+	{Name: "ORDERED_SAMPLE_LIST", Type: arrow.BinaryTypes.String},
+}, nil)
+
+// transformCNARecordBatch converts one tsv record batch into two output record batches:
+// 1. A gene-centric batch with comma-delimited values per gene
+// 2. A single-row batch containing the ordered sample list
 func transformCNARecordBatch(
 	cancerStudyName, geneticProfileName string,
 	rec arrow.RecordBatch,
 	mem memory.Allocator,
-) (arrow.RecordBatch, error) {
-	bldr := array.NewRecordBuilder(mem, cnaTableSchema)
-	defer bldr.Release()
+) (geneticAlterationsRec arrow.RecordBatch, geneticProfileSamplesRec arrow.RecordBatch, err error) {
+	// Build the gene values record batch
+	geneticAlterationsBuilder := array.NewRecordBuilder(mem, geneticAlterationsSchema)
+	defer geneticAlterationsBuilder.Release()
 
-	sampleIDBldr := bldr.Field(0).(*array.StringBuilder)
-	studyBldr := bldr.Field(1).(*array.StringBuilder)
-	geneBldr := bldr.Field(2).(*array.StringBuilder)
-	profileBldr := bldr.Field(3).(*array.StringBuilder)
-	alterationBldr := bldr.Field(4).(*array.StringBuilder)
+	studyBldr := geneticAlterationsBuilder.Field(0).(*array.StringBuilder)
+	profileBldr := geneticAlterationsBuilder.Field(1).(*array.StringBuilder)
+	geneSymbolBldr := geneticAlterationsBuilder.Field(2).(*array.StringBuilder)
+	valuesBldr := geneticAlterationsBuilder.Field(3).(*array.StringBuilder)
 
+	// Build the sample order record batch
+	geneticProfileSamplesBldr := array.NewRecordBuilder(mem, geneticProfileSamplesSchema)
+	defer geneticProfileSamplesBldr.Release()
+
+	sampleStudyBldr := geneticProfileSamplesBldr.Field(0).(*array.StringBuilder)
+	sampleProfileBldr := geneticProfileSamplesBldr.Field(1).(*array.StringBuilder)
+	sampleListBldr := geneticProfileSamplesBldr.Field(2).(*array.StringBuilder)
+
+	// Get gene symbols column
 	geneSymbols, ok := rec.Column(0).(*array.String)
 	if !ok {
-		return nil, fmt.Errorf("first column (gene symbols) is not a string array")
+		return nil, nil, fmt.Errorf("first column (gene symbols) is not a string array")
 	}
 
 	prefix := cancerStudyName + "_"
 	numCols := int(rec.NumCols())
 	numRows := int(rec.NumRows())
 
-	// we start at index 2 because 0:hugo, 1:entrez
+	// Build the ordered sample list (we start at index 2 because 0:hugo, 1:entrez)
+	var sampleIDs []string
 	for colIdx := 2; colIdx < numCols; colIdx++ {
 		colName := rec.ColumnName(colIdx)
-		alterations, ok := rec.Column(colIdx).(*array.String)
-		if !ok {
-			return nil, fmt.Errorf("column %q is not a string array", colName)
+		sampleID := prefix + colName
+		sampleIDs = append(sampleIDs, sampleID)
+	}
+	orderedSampleList := strings.Join(sampleIDs, ",")
+
+	// Add single row to sample order record batch
+	sampleStudyBldr.Append(cancerStudyName)
+	sampleProfileBldr.Append(geneticProfileName)
+	sampleListBldr.Append(orderedSampleList)
+
+	// Process each gene (row)
+	for rowIdx := 0; rowIdx < numRows; rowIdx++ {
+		geneSymbol := geneSymbols.Value(rowIdx)
+
+		// Collect alteration values for this gene across all samples
+		var alterationValues []string
+		for colIdx := 2; colIdx < numCols; colIdx++ {
+			alterations, ok := rec.Column(colIdx).(*array.String)
+			if !ok {
+				return nil, nil, fmt.Errorf("column %q is not a string array", rec.ColumnName(colIdx))
+			}
+			alterationValues = append(alterationValues, alterations.Value(rowIdx))
 		}
 
-		sampleID := prefix + colName
-		for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-			sampleIDBldr.Append(sampleID)
-			studyBldr.Append(cancerStudyName)
-			geneBldr.Append(geneSymbols.Value(rowIdx))
-			profileBldr.Append(geneticProfileName)
-			alterationBldr.Append(alterations.Value(rowIdx))
-		}
+		// Join the alteration values with commas
+		valuesStr := strings.Join(alterationValues, ",")
+
+		// Append to gene values record batch
+		studyBldr.Append(cancerStudyName)
+		profileBldr.Append(geneticProfileName)
+		geneSymbolBldr.Append(geneSymbol)
+		valuesBldr.Append(valuesStr)
 	}
 
-	// create output record
-	recOut := bldr.NewRecordBatch()
+	// Create output record batches
+	geneticAlterationsRec = geneticAlterationsBuilder.NewRecordBatch()
+	geneticProfileSamplesRec = geneticProfileSamplesBldr.NewRecordBatch()
 
-	// validation step
-	expected := recOut.Column(0).Len()
-	for i := 1; i < int(recOut.NumCols()); i++ {
-		col := recOut.Column(i)
-		if col.Len() != expected {
-			recOut.Release()
-			return nil, fmt.Errorf(
-				"column %q length mismatch: %d vs %d",
-				recOut.ColumnName(i), col.Len(), expected,
+	// Validation for gene values record
+	expectedGeneRows := geneticAlterationsRec.Column(0).Len()
+	for i := 1; i < int(geneticAlterationsRec.NumCols()); i++ {
+		col := geneticAlterationsRec.Column(i)
+		if col.Len() != expectedGeneRows {
+			geneticAlterationsRec.Release()
+			geneticProfileSamplesRec.Release()
+			return nil, nil, fmt.Errorf(
+				"gene values column %q length mismatch: %d vs %d",
+				geneticAlterationsRec.ColumnName(i), col.Len(), expectedGeneRows,
 			)
 		}
 	}
 
-	return recOut, nil
+	// Validation for sample order record (should have exactly 1 row)
+	if geneticProfileSamplesRec.NumRows() != 1 {
+		geneticAlterationsRec.Release()
+		geneticProfileSamplesRec.Release()
+		return nil, nil, fmt.Errorf(
+			"sample order record should have 1 row, got %d",
+			geneticProfileSamplesRec.NumRows(),
+		)
+	}
+
+	return geneticAlterationsRec, geneticProfileSamplesRec, nil
 }

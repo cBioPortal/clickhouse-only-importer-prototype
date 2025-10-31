@@ -18,10 +18,12 @@ import (
 // example workflows:
 
 // convert mode:
+// Converts TSV files to two parquet files each: *_genetic_alterations.parquet and *_genetic_profile_samples.parquet
 //go run ./cmd/cli/main.go -mode convert -tsv-dir ./data -parquet-dir ./output
 
 // combine mode
-//go run ./cmd/cli/main.go -mode combine -parquet-dir ./output -output final.parquet
+// Combines parquet files into two final files: combined-all-cna_genetic_alterations.parquet and combined-all-cna_genetic_profile_samples.parquet
+//go run ./cmd/cli/main.go -mode combine -parquet-dir ./output -output combine-all-cna.parquet
 
 func main() {
 	// command-line flags
@@ -102,29 +104,60 @@ func runConvertMode(tsvRootDir, parquetDir string, mem memory.Allocator) {
 }
 
 func runCombineMode(parquetDir, outputFile string, mem memory.Allocator) {
-	log.Print("=== COMBINE MODE: Merge Parquet files into single file ===")
+	log.Print("=== COMBINE MODE: Merge Parquet files into two combined files ===")
 	log.Printf("Reading parquet files from: %s", parquetDir)
 
+	// Generate two output paths based on the provided output file
+	alterationsOutputPath, samplesOutputPath := generateCombinedOutputPaths(parquetDir, outputFile)
+
+	log.Printf("Combining genetic alterations files into: %s", alterationsOutputPath)
+	log.Printf("Combining genetic profile samples files into: %s", samplesOutputPath)
+
+	// Combine genetic alterations files
+	alterationsPattern := filepath.Join(parquetDir, "*_genetic_alterations.parquet")
+	if err := cna.CombineParquetFilesByPattern(alterationsPattern, alterationsOutputPath, mem); err != nil {
+		log.Fatalf("Error combining genetic alterations files: %v", err)
+	}
+	log.Printf("✓ Combined genetic alterations file written to: %s", alterationsOutputPath)
+
+	// Combine genetic profile samples files
+	samplesPattern := filepath.Join(parquetDir, "*_genetic_profile_samples.parquet")
+	if err := cna.CombineParquetFilesByPattern(samplesPattern, samplesOutputPath, mem); err != nil {
+		log.Fatalf("Error combining genetic profile samples files: %v", err)
+	}
+	log.Printf("✓ Combined genetic profile samples file written to: %s", samplesOutputPath)
+}
+
+// generateCombinedOutputPaths creates two output paths for combined files based on a base output filename
+func generateCombinedOutputPaths(parquetDir, baseOutputFile string) (alterationsPath, samplesPath string) {
 	// Use absolute path if provided, otherwise join with parquet directory
-	var combinedParquetPath string
-	if filepath.IsAbs(outputFile) {
-		combinedParquetPath = outputFile
+	var basePath string
+	if filepath.IsAbs(baseOutputFile) {
+		basePath = baseOutputFile
 	} else {
-		combinedParquetPath = filepath.Join(parquetDir, outputFile)
-	}
-	log.Printf("Combining all parquet files into: %s", combinedParquetPath)
-
-	if err := cna.CombineParquetFiles(parquetDir, combinedParquetPath, mem); err != nil {
-		log.Fatalf("Error combining parquet files: %v", err)
+		basePath = filepath.Join(parquetDir, baseOutputFile)
 	}
 
-	log.Printf("✓ Combined parquet file written to: %s", combinedParquetPath)
+	// Remove .parquet extension if present
+	basePathWithoutExt := strings.TrimSuffix(basePath, ".parquet")
+
+	// Create two output paths
+	alterationsPath = basePathWithoutExt + "_genetic_alterations.parquet"
+	samplesPath = basePathWithoutExt + "_genetic_profile_samples.parquet"
+
+	return alterationsPath, samplesPath
 }
 
 func findCNAFiles(rootDir string) ([]cna.CNAFileInput, error) {
 	var cnaFiles []cna.CNAFileInput
-	// Maps to track files by directory
-	metaFilesByDir := make(map[string]string)
+	// Maps to track meta files by directory and their data_filename
+	type metaInfo struct {
+		path          string
+		cancerStudyId string
+		stableId      string
+	}
+	// Key: directory + data_filename (e.g., "/path/to/study/data_cna.txt")
+	metaFilesByDataFile := make(map[string]*metaInfo)
 	dataFilesByDir := make(map[string][]string)
 
 	// first pass: collect all meta and data files
@@ -149,13 +182,32 @@ func findCNAFiles(rootDir string) ([]cna.CNAFileInput, error) {
 		// Check for meta file
 		metaMatched, _ := regexp.MatchString(`^meta_.*cna.*\.txt$`, fileName)
 		if metaMatched && !strings.Contains(fileName, "seg") {
-			metaFilesByDir[dir] = path
+			// Extract metadata including data_filename
+			cancerStudyId, stableId, dataFilename, err := extractMetadataWithDataFilename(path)
+			if err != nil {
+				log.Printf("warning: failed to extract metadata from %s: %v", path, err)
+				return nil
+			}
+
+			if dataFilename == "" {
+				log.Printf("warning: meta file %s has no data_filename property", path)
+				return nil
+			}
+
+			// Store meta info indexed by full path to data file
+			dataFilePath := filepath.Join(dir, dataFilename)
+			metaFilesByDataFile[dataFilePath] = &metaInfo{
+				path:          path,
+				cancerStudyId: cancerStudyId,
+				stableId:      stableId,
+			}
+			log.Printf("meta file %s references data file %s", path, dataFilePath)
 			return nil
 		}
 
-		// Check for data file
+		// Check for data file (skip files with "seg" in the name)
 		dataMatched, _ := regexp.MatchString(`^data_.*cna.*\.txt$`, fileName)
-		if dataMatched {
+		if dataMatched && !strings.Contains(fileName, "seg") {
 			dataFilesByDir[dir] = append(dataFilesByDir[dir], path)
 		}
 
@@ -166,7 +218,7 @@ func findCNAFiles(rootDir string) ([]cna.CNAFileInput, error) {
 	}
 
 	// second pass: process data files with their paired meta files
-	for dir, dataPaths := range dataFilesByDir {
+	for _, dataPaths := range dataFilesByDir {
 		for _, path := range dataPaths {
 			log.Printf("found: %s", path)
 
@@ -181,13 +233,14 @@ func findCNAFiles(rootDir string) ([]cna.CNAFileInput, error) {
 				return nil, fmt.Errorf("failed to get schema from %s: %w", path, err)
 			}
 
-			// Look for paired meta file in same directory
+			// Look for paired meta file using the data file path
 			var cancerStudyId, stableId string
-			if metaPath, hasMetaFile := metaFilesByDir[dir]; hasMetaFile {
-				cancerStudyId, stableId, err = extractMetadata(metaPath)
-				if err != nil {
-					log.Printf("warning: failed to extract metadata from %s: %v", metaPath, err)
-				}
+			if meta, hasMeta := metaFilesByDataFile[path]; hasMeta {
+				cancerStudyId = meta.cancerStudyId
+				stableId = meta.stableId
+				log.Printf("matched meta file %s for data file %s", meta.path, path)
+			} else {
+				log.Printf("warning: no meta file found for %s", path)
 			}
 
 			geneticProfileId := ""
@@ -207,11 +260,11 @@ func findCNAFiles(rootDir string) ([]cna.CNAFileInput, error) {
 	return cnaFiles, nil
 }
 
-// extractMetadata reads a meta file and extracts cancer_study_identifier and stable_id
-func extractMetadata(metaPath string) (cancerStudyId, stableId string, err error) {
+// extractMetadataWithDataFilename reads a meta file and extracts cancer_study_identifier, stable_id, and data_filename
+func extractMetadataWithDataFilename(metaPath string) (cancerStudyId, stableId, dataFilename string, err error) {
 	file, err := os.Open(metaPath)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer file.Close()
 
@@ -235,17 +288,19 @@ func extractMetadata(metaPath string) (cancerStudyId, stableId string, err error
 			cancerStudyId = value
 		case "stable_id":
 			stableId = value
+		case "data_filename":
+			dataFilename = value
 		}
 
-		// Early exit if we found both
-		if cancerStudyId != "" && stableId != "" {
+		// Early exit if we found all three
+		if cancerStudyId != "" && stableId != "" && dataFilename != "" {
 			break
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
-	return cancerStudyId, stableId, nil
+	return cancerStudyId, stableId, dataFilename, nil
 }
